@@ -1,46 +1,61 @@
 from typing import List
-from urllib.request import Request
-
 from fastapi import APIRouter, Depends, status, HTTPException, Response, UploadFile, File
-from fastapi.responses import JSONResponse, StreamingResponse
+from fastapi.responses import JSONResponse
 from sqlalchemy.ext.asyncio import AsyncSession
 from sqlalchemy.future import select
+from minio import Minio
+from minio.error import S3Error
 import os
-import shutil
 import json
 
-from core.deps import get_session, get_current_user
-from models import User, Maps
-from models.meliponary import Meliponary
-from schemas.meliponary_schema import MeliponaryCreateSchema, MeliponarySchema
-from utils import verify_user_exists
+from core.deps import get_session
+from models import Maps
 
 maps_router = APIRouter()
-UPLOAD_DIR = "geojson_files"
-BASE_URL = os.getenv('BASE_URL')
+
+# MinIO configuration
+MINIO_URL = os.getenv('MINIO_URL')
+MINIO_ACCESS_KEY = os.getenv('MINIO_ACCESS_KEY')
+MINIO_SECRET_KEY = os.getenv('MINIO_SECRET_KEY')
+MINIO_BUCKET_NAME = os.getenv('MINIO_BUCKET_NAME')
+
+minio_client = Minio(
+    MINIO_URL,
+    access_key=MINIO_ACCESS_KEY,
+    secret_key=MINIO_SECRET_KEY,
+    secure=False
+)
+
+# Ensure the bucket exists
+if not minio_client.bucket_exists(MINIO_BUCKET_NAME):
+    minio_client.make_bucket(MINIO_BUCKET_NAME)
 
 
 @maps_router.post("/upload/")
 async def upload_geojson(files: List[UploadFile] = File(...), session: AsyncSession = Depends(get_session)):
-    if not os.path.exists(UPLOAD_DIR):
-        os.makedirs(UPLOAD_DIR)
-
-    file_paths = []
+    file_urls = []
     for file in files:
-        lowercase_filename = file.filename.lower()
-        file_path = os.path.join(UPLOAD_DIR, lowercase_filename)
+        file_path = f"{file.filename.lower()}"
+        try:
+            minio_client.put_object(
+                MINIO_BUCKET_NAME,
+                file_path,
+                file.file,
+                length=-1,
+                part_size=10*1024*1024,
+                content_type=file.content_type
+            )
+            file_url = f"https://{MINIO_URL}/{MINIO_BUCKET_NAME}/{file_path}"
+            file_urls.append(file_url)
 
-        with open(file_path, "wb") as buffer:
-            shutil.copyfileobj(file.file, buffer)
-
-        file_paths.append(file_path)
-
-        # Save file data to the database
-        new_map = Maps(file_path=file_path, name=file.filename)
-        session.add(new_map)
+            # Save file data to the database
+            new_map = Maps(file_path=file_url, name=file.filename)
+            session.add(new_map)
+        except S3Error as e:
+            raise HTTPException(status_code=500, detail=f"MinIO error: {str(e)}")
 
     await session.commit()
-    return JSONResponse(content={"file_paths": file_paths})
+    return JSONResponse(content={"file_urls": file_urls})
 
 @maps_router.get("/")
 async def list_geojson(session: AsyncSession = Depends(get_session)):
@@ -48,18 +63,17 @@ async def list_geojson(session: AsyncSession = Depends(get_session)):
         result = await session.execute(select(Maps))
         maps = result.scalars().all()
 
-    file_urls = [{"id": map.id, "name": map.name, "url": f"{BASE_URL}/api/v1/maps/content/{os.path.basename(map.file_path)}"} for map in maps]
+    file_urls = [{"id": map.id, "name": map.name, "url": map.file_path} for map in maps]
     return JSONResponse(content=file_urls)
 
 @maps_router.get("/content/{filename}")
 async def geojson_content(filename: str):
-    file_path = os.path.join(UPLOAD_DIR, filename)
-    if not os.path.exists(file_path):
-        return JSONResponse(content={"error": "File not found"}, status_code=404)
-    with open(file_path, "r") as file:
-        content = json.load(file)
-    return JSONResponse(content=content)
-
+    try:
+        response = minio_client.get_object(MINIO_BUCKET_NAME, filename)
+        content = json.load(response)
+        return JSONResponse(content=content)
+    except S3Error as e:
+        return JSONResponse(content={"error": f"MinIO error: {str(e)}"}, status_code=404)
 
 @maps_router.delete("/{map_id}", status_code=status.HTTP_204_NO_CONTENT)
 async def delete_geojson(map_id: int, session: AsyncSession = Depends(get_session)):
@@ -70,10 +84,12 @@ async def delete_geojson(map_id: int, session: AsyncSession = Depends(get_sessio
         if not map_entry:
             raise HTTPException(status_code=status.HTTP_404_NOT_FOUND, detail="Map not found")
 
-        # Delete the file from the file system
-        file_path = map_entry.file_path
-        if os.path.exists(file_path):
-            os.remove(file_path)
+        # Delete the file from MinIO
+        file_path = map_entry.file_path.split(f"http://{MINIO_URL}/{MINIO_BUCKET_NAME}/")[1]
+        try:
+            minio_client.remove_object(MINIO_BUCKET_NAME, file_path)
+        except S3Error as e:
+            raise HTTPException(status_code=500, detail=f"MinIO error: {str(e)}")
 
         # Delete the map entry from the database
         await session.delete(map_entry)

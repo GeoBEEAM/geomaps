@@ -24,9 +24,8 @@ app.include_router(meliponary_router, prefix='/api/v1/meliponaries', tags=['meli
 app.include_router(apiary_router, prefix='/api/v1/apiaries', tags=['apiaries'])
 app.include_router(user_router, prefix='/api/v1/users', tags=['users'])
 app.include_router(auth_router, prefix='/api/v1/auth', tags=['Authenticate'])
-app.include_router(maps_router, prefix='/api/v1/maps', tags=['maps'])
+app.include_router(maps_router, prefix="/api/v1/maps", tags=["maps"])
 
 if __name__ == "__main__":
     import uvicorn
-
     uvicorn.run("main:app", host="0.0.0.0", port=8000, log_level='info', reload=True)

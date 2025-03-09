@@ -8,6 +8,7 @@ metadata:
     cert-manager.io/cluster-issuer: "letsencrypt"
     nginx.ingress.kubernetes.io/proxy-buffer-size: "1000m"
     nginx.ingress.kubernetes.io/client-max-body-size: "1000m"  # Adjust the size as needed
+    nginx.ingress.kubernetes.io/proxy-body-size: "1000m"
 spec:
   rules:
   - host: api-geobee.ludolabs.rocks
