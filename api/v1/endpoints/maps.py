@@ -85,7 +85,7 @@ async def delete_geojson(map_id: int, session: AsyncSession = Depends(get_sessio
             raise HTTPException(status_code=status.HTTP_404_NOT_FOUND, detail="Map not found")
 
         # Delete the file from MinIO
-        file_path = map_entry.file_path.split(f"http://{MINIO_URL}/{MINIO_BUCKET_NAME}/")[1]
+        file_path = map_entry.file_path.split(f"https://{MINIO_URL}/{MINIO_BUCKET_NAME}/")[1]
         try:
             minio_client.remove_object(MINIO_BUCKET_NAME, file_path)
         except S3Error as e:
