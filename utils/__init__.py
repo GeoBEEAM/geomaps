@@ -1,9 +1,11 @@
 import json
 import os
 import traceback
-from typing import Optional
+from typing import Optional, List
 
 from fastapi import status, HTTPException
+from minio import Minio
+from minio.error import S3Error
 from shapely.geometry import Point, shape
 from shapely.validation import explain_validity
 from sqlalchemy.ext.asyncio import AsyncSession
@@ -11,7 +13,18 @@ from sqlalchemy.future import select
 
 from models import User
 
-UPLOAD_DIR = "geojson_files"
+# MinIO configuration
+MINIO_URL = os.getenv('MINIO_URL')
+MINIO_ACCESS_KEY = os.getenv('MINIO_ACCESS_KEY')
+MINIO_SECRET_KEY = os.getenv('MINIO_SECRET_KEY')
+MINIO_BUCKET_NAME = os.getenv('MINIO_BUCKET_NAME')
+
+minio_client = Minio(
+    MINIO_URL,
+    access_key=MINIO_ACCESS_KEY,
+    secret_key=MINIO_SECRET_KEY,
+    secure=False
+)
 
 
 def calcular_raio_voo(tipo, especie=None):
@@ -41,35 +54,42 @@ def calcular_capacidade_suporte_meliponicultura(hectares):
     return round(colmeias_por_hectare)
 
 
+def list_geojson_files_from_minio() -> List[str]:
+    try:
+        objects = minio_client.list_objects(MINIO_BUCKET_NAME, prefix='', recursive=True)
+        geojson_files = [obj.object_name for obj in objects if obj.object_name.endswith('.geojson')]
+        return geojson_files
+    except S3Error as e:
+        raise HTTPException(status_code=500, detail=f"MinIO error: {str(e)}")
+
+
 async def process_geojson(latitude: str, longitude: str, tipo: str, especie: Optional[str] = None):
-    # Function implementation
     try:
         centro = Point(float(longitude), float(latitude))
         raio_voo_dec = calcular_raio_voo(tipo, especie)
         buffer = centro.buffer(raio_voo_dec * 1000)  # Convert to meters
 
         areas = {}
+        geojson_files = list_geojson_files_from_minio()
 
-        for filename in os.listdir(UPLOAD_DIR):
-            if filename.endswith('.geojson'):
-                file_path = os.path.join(UPLOAD_DIR, filename)
-                with open(file_path, 'r') as file:
-                    geojson_data = json.load(file)
-                    layers = geojson_data['features']
+        for filename in geojson_files:
+            response = minio_client.get_object(MINIO_BUCKET_NAME, filename)
+            geojson_data = json.load(response)
+            layers = geojson_data['features']
 
-                    for layer in layers:
-                        geom = shape(layer['geometry'])
-                        if not geom.is_valid:
-                            print(f"Invalid geometry in {filename}: {explain_validity(geom)}")
-                            continue
+            for layer in layers:
+                geom = shape(layer['geometry'])
+                if not geom.is_valid:
+                    print(f"Invalid geometry in {filename}: {explain_validity(geom)}")
+                    continue
 
-                        if geom.intersects(buffer):
-                            print(f"Intersects {layer}")
-                            nome_camada = layer['properties']['VEGETAÇÃ']
-                            area = float(layer['properties']['AREA (Ha)'])
-                            if nome_camada not in areas:
-                                areas[nome_camada] = 0
-                            areas[nome_camada] += area
+                if geom.intersects(buffer):
+                    # print(f"Intersects {layer}")
+                    nome_camada = layer['properties']['CLASSE']
+                    area = float(layer['properties']['AREA_HA'])
+                    if nome_camada not in areas:
+                        areas[nome_camada] = 0
+                    areas[nome_camada] += area
 
         area_total = (areas.get('URBANO', 0) + areas.get('ARBUSTIVO', 0) + areas.get('HERBACEO', 0))
         suporte_apicultura = calcular_capacidade_suporte_apicultura(area_total)
@@ -89,6 +109,7 @@ async def verify_user_exists(user_id: int, session: AsyncSession):
     user = result.scalar()
     if user is None:
         raise HTTPException(status_code=status.HTTP_404_NOT_FOUND, detail='Usuário não existe no sistema')
+
 
 def read_files_from_directory(directory):
     files_data = {}

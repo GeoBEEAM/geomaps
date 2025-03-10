@@ -15,6 +15,8 @@ meliponary_router = APIRouter()
 
 logging.basicConfig(level=logging.INFO, format='%(asctime)s - %(name)s - %(levelname)s - %(message)s')
 logger = logging.getLogger(__name__)
+
+
 @meliponary_router.post('/', response_model=MeliponarySchema, status_code=status.HTTP_201_CREATED)
 async def create_meliponary(
         meliponary: MeliponaryCreateSchema,
@@ -23,7 +25,11 @@ async def create_meliponary(
 ):
     await verify_user_exists(auth_user.id, session)
     suporte = await process_geojson(meliponary.latitude, meliponary.longitude, auth_user.role, meliponary.especieAbelha)
-    capacidade_de_suporte = suporte - meliponary.qtdColmeiasOutrosMeliponarios if meliponary.qtdColmeiasOutrosMeliponarios else suporte
+    if suporte is None:
+        raise HTTPException(status_code=status.HTTP_500_INTERNAL_SERVER_ERROR,
+                            detail="Failed to calculate support capacity")
+    capacidade_de_suporte = int(suporte) - int(
+        meliponary.qtdColmeiasOutrosMeliponarios) if meliponary.qtdColmeiasOutrosMeliponarios else int(suporte)
     new_meliponary = Meliponary(name=meliponary.name,
                                 latitude=meliponary.latitude,
                                 longitude=meliponary.longitude,
@@ -48,13 +54,20 @@ async def create_meliponary(
     return new_meliponary
 
 
+@meliponary_router.get('/all', response_model=List[MeliponarySchema])
+async def get_all_meliponaries(session: AsyncSession = Depends(get_session)):
+    result = await session.execute(select(Meliponary))
+    return result.scalars().all()
+
 @meliponary_router.get('/', response_model=List[MeliponarySchema])
 async def get_meliponaries(session: AsyncSession = Depends(get_session), auth_user: User = Depends(get_current_user)):
     result = await session.execute(select(Meliponary).filter(Meliponary.userId == auth_user.id))
     return result.scalars().all()
 
+
 @meliponary_router.get('/{id}', response_model=MeliponarySchema)
-async def get_meliponary(id: int, session: AsyncSession = Depends(get_session), auth_user: User = Depends(get_current_user),):
+async def get_meliponary(id: int, session: AsyncSession = Depends(get_session),
+                         auth_user: User = Depends(get_current_user), ):
     result = await session.execute(select(Meliponary).filter(Meliponary.id == id))
     meliponary = result.scalar()
     if meliponary is None:
@@ -63,7 +76,8 @@ async def get_meliponary(id: int, session: AsyncSession = Depends(get_session), 
 
 
 @meliponary_router.put('/{id}', response_model=MeliponaryCreateSchema)
-async def update_meliponary(id: int, meliponary: MeliponaryCreateSchema, session: AsyncSession = Depends(get_session), auth_user: User = Depends(get_current_user),):
+async def update_meliponary(id: int, meliponary: MeliponaryCreateSchema, session: AsyncSession = Depends(get_session),
+                            auth_user: User = Depends(get_current_user), ):
     await verify_user_exists(meliponary.userId, session)
     result = await session.execute(select(Meliponary).filter(Meliponary.id == id))
     meliponary_db = result.scalar()
@@ -76,11 +90,12 @@ async def update_meliponary(id: int, meliponary: MeliponaryCreateSchema, session
 
 
 @meliponary_router.delete('/{id}', status_code=status.HTTP_204_NO_CONTENT)
-async def delete_meliponary(id: int, session: AsyncSession = Depends(get_session), auth_user: User = Depends(get_current_user),):
+async def delete_meliponary(id: int, session: AsyncSession = Depends(get_session),
+                            auth_user: User = Depends(get_current_user), ):
     result = await session.execute(select(Meliponary).filter(Meliponary.id == id))
     meliponary = result.scalar_one_or_none()
     if meliponary is None:
         raise HTTPException(status_code=status.HTTP_404_NOT_FOUND, detail='Meliponary not found')
-    session.delete(meliponary)
+    await session.delete(meliponary)
     await session.commit()
     return Response(status_code=status.HTTP_204_NO_CONTENT)

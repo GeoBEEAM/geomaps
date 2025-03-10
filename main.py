@@ -20,7 +20,7 @@ app.add_middleware(
 
 from api.v1.endpoints.meliponary import meliponary_router
 
-app.include_router(meliponary_router, prefix='/api/v1/meliponaries', tags=['meliponaries'])
+app.include_router(meliponary_router, prefix='/api/v1/meliponary', tags=['meliponary'])
 app.include_router(apiary_router, prefix='/api/v1/apiaries', tags=['apiaries'])
 app.include_router(user_router, prefix='/api/v1/users', tags=['users'])
 app.include_router(auth_router, prefix='/api/v1/auth', tags=['Authenticate'])
