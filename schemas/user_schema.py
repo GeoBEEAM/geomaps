@@ -1,4 +1,4 @@
-from typing import Optional
+from typing import Optional, List
 from pydantic import BaseModel as SCBaseModel
 from datetime import datetime
 
@@ -8,7 +8,7 @@ class CreateUserSchema(SCBaseModel):
     email: str
     password: str
     phone: str
-    role: str
+    profiles: List[int]  # IDs dos perfis
 
     class Config:
         from_attributes = True
@@ -20,7 +20,8 @@ class UserSchema(SCBaseModel):
     cpf: str
     email: str
     phone: str
-    role: str
+    profiles: List[int]
+    perfis: List[str]  # nomes dos perfis
     createdAt: datetime
     updatedAt: Optional[datetime]
 

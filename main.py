@@ -6,6 +6,9 @@ from api.v1.endpoints.apiary import apiary_router
 from api.v1.endpoints.auth import auth_router
 from api.v1.endpoints.maps import maps_router
 from api.v1.endpoints.users import user_router
+from api.v1.endpoints.dashboard import router as dashboard_router
+from api.v1.endpoints.management import management_router
+
 load_dotenv()  # Load environment variables from .env file
 app = FastAPI()
 
@@ -20,11 +23,13 @@ app.add_middleware(
 
 from api.v1.endpoints.meliponary import meliponary_router
 
-app.include_router(meliponary_router, prefix='/api/v1/meliponary', tags=['meliponary'])
-app.include_router(apiary_router, prefix='/api/v1/apiaries', tags=['apiaries'])
-app.include_router(user_router, prefix='/api/v1/users', tags=['users'])
-app.include_router(auth_router, prefix='/api/v1/auth', tags=['Authenticate'])
-app.include_router(maps_router, prefix="/api/v1/maps", tags=["maps"])
+app.include_router(meliponary_router, prefix='/api/v1/meliponary', tags=['Gestão de Meliponários'])
+app.include_router(apiary_router, prefix='/api/v1/apiaries', tags=['Gestão de Apiários'])
+app.include_router(user_router, prefix='/api/v1/users', tags=['Gestão de Usuários'])
+app.include_router(auth_router, prefix='/api/v1/auth', tags=['Autenticação'])
+app.include_router(maps_router, prefix="/api/v1/maps", tags=["Gestão de Mapas"])
+app.include_router(dashboard_router, prefix="/api/v1", tags=["Dashboard"])
+app.include_router(management_router, prefix='/api/v1/management', tags=['Gestão da Aplicação'])
 
 if __name__ == "__main__":
     import uvicorn

@@ -4,21 +4,27 @@ from sqlalchemy.ext.asyncio import AsyncSession
 from core.database import engine
 from core.security import generate_password_hash
 from models.user import User
+from models.profile import Profile
 
 async def seed_data():
     async with AsyncSession(engine) as session:
         async with session.begin():
-            # Add seed data for User
+            # Perfis
+            admin_profile = Profile(name="Admin")
+            apicultor_profile = Profile(name="Apicultor")
+            meliponicultor_profile = Profile(name="Meliponicultor")
+            session.add_all([admin_profile, apicultor_profile, meliponicultor_profile])
+
+            # Usuários
             password = generate_password_hash("12345678")
-            user1 = User(fullName="Demonstração Meliponário", cpf="31312132", phone="asdasdasdasd", email="meli@geobee.app", password=password , role="APICULTOR")
-            user2 = User(fullName="Demonstração Apiário", cpf="123123123", phone="asdasdasd", email="apic@geobee.app", password=password, role="MELIPONICULTOR")
-            session.add_all([user1, user2])
-
-            # # Add seed data for Maps
-            # map1 = Maps(file_path="/path/to/map1", name="Map 1")
-            # map2 = Maps(file_path="/path/to/map2", name="Map 2")
-            # session.add_all([map1, map2])
-
+            admin_user = User(fullName="Admin GeoBee", cpf="000000001", phone="999999999", email="admin@geobee.app", password=password)
+            apic_user = User(fullName="Demonstração Apiário", cpf="000000002", phone="888888888", email="apic@geobee.app", password=password)
+            meli_user = User(fullName="Demonstração Meliponário", cpf="000000003", phone="777777777", email="meli@geobee.app", password=password)
+            # Relaciona perfis aos usuários
+            admin_user.profiles.append(admin_profile)
+            apic_user.profiles.append(apicultor_profile)
+            meli_user.profiles.append(meliponicultor_profile)
+            session.add_all([admin_user, apic_user, meli_user])
         await session.commit()
         print("Seed data inserted successfully!")
 
