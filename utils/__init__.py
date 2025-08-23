@@ -10,6 +10,7 @@ from sqlalchemy.future import select
 import geopandas as gpd
 import pandas as pd
 from models import User
+from models.apiary import Apiary
 
 # MinIO configuration
 MINIO_URL = os.getenv('MINIO_URL')
@@ -17,14 +18,17 @@ MINIO_ACCESS_KEY = os.getenv('MINIO_ACCESS_KEY')
 MINIO_SECRET_KEY = os.getenv('MINIO_SECRET_KEY')
 MINIO_BUCKET_NAME = os.getenv('MINIO_BUCKET_NAME')
 
+MINIO_SECURE = os.getenv('MINIO_SECURE', 'false').strip().lower() in ('true', '1', 'yes')
+
 minio_client = Minio(
     MINIO_URL,
-    access_key=MINIO_ACCESS_KEY,
-    secret_key=MINIO_SECRET_KEY,
-    secure=False
+    access_key=MINIO_ACCESS_KEY or '',
+    secret_key=MINIO_SECRET_KEY or '',
+    secure=MINIO_SECURE
 )
 
-GEOJSON_CACHE_DIR = os.path.join(os.path.dirname(__file__), '../../geojson_files_cache')
+PROJECT_ROOT = os.path.abspath(os.path.join(os.path.dirname(__file__), '..'))
+GEOJSON_CACHE_DIR = os.path.join(PROJECT_ROOT, 'geojson_files_cache')
 os.makedirs(GEOJSON_CACHE_DIR, exist_ok=True)
 
 VEGETACAO_APICULTOR = ['ARBOREO', 'ARBUSTIVO', 'HERBACEO']
@@ -66,6 +70,8 @@ def calcular_capacidade_suporte_meliponicultura(area_ha: float) -> int:
 
 
 def list_geojson_files_from_minio() -> List[str]:
+    if not MINIO_BUCKET_NAME:
+        raise HTTPException(status_code=500, detail="MinIO bucket não configurado.")
     try:
         objects = minio_client.list_objects(MINIO_BUCKET_NAME, prefix='', recursive=True)
         return [obj.object_name for obj in objects if obj.object_name.endswith('.geojson')]
@@ -76,9 +82,23 @@ def list_geojson_files_from_minio() -> List[str]:
 def get_geojson_file_cached(filename):
     local_path = os.path.join(GEOJSON_CACHE_DIR, os.path.basename(filename))
     if not os.path.exists(local_path):
-        response = minio_client.get_object(MINIO_BUCKET_NAME, filename)
-        with open(local_path, 'wb') as f:
-            f.write(response.read())
+        response = None
+        try:
+            response = minio_client.get_object(MINIO_BUCKET_NAME, filename)
+            data = response.read()
+            with open(local_path, 'wb') as f:
+                f.write(data)
+        except S3Error as e:
+            raise HTTPException(status_code=500, detail=f"MinIO error ao obter {filename}: {str(e)}")
+        finally:
+            try:
+                if response is not None:
+                    response.close()
+                    if hasattr(response, 'release_conn'):
+                        response.release_conn()
+            except Exception:
+                # Evita propagar erro de limpeza de recurso
+                pass
     return local_path
 
 
@@ -90,11 +110,22 @@ async def verify_user_exists(user_id: int, session: AsyncSession):
 
 
 def calcular_area_buffer(longitude: float, latitude: float, raio_km: float = 1.5, geojson_files: list = None):
-    ponto = Point(float(longitude), float(latitude))
-    buffer = ponto.buffer(raio_km * 1000)
+    """
+    Se geojson_files não for fornecido, retorna o polígono do buffer reprojetado de volta para EPSG:4326.
+    Caso contrário, retorna a soma das áreas (ha) das classes de vegetação dentro do buffer.
+    """
+    crs_metric = "EPSG:31983"
+    crs_geo = "EPSG:4326"
+    centro = Point(float(longitude), float(latitude))
+    # Constrói buffer em CRS métrico
+    gdf_centro = gpd.GeoDataFrame(geometry=[centro], crs=crs_geo).to_crs(crs_metric)
+    buffer_m = gdf_centro.geometry.iloc[0].buffer(raio_km * 1000)
     if not geojson_files:
-        return buffer
-    soma_areas = 0
+        # Reprojeta o buffer de volta para GEO para compatibilidade com usos existentes
+        buffer_geo = gpd.GeoSeries([buffer_m], crs=crs_metric).to_crs(crs_geo).iloc[0]
+        return buffer_geo
+    # Quando arquivos são fornecidos, calcula a área de interseção (ha)
+    soma_areas = 0.0
     for filename in geojson_files:
         with open(filename, 'r') as f:
             geojson_data = json.load(f)
@@ -102,57 +133,67 @@ def calcular_area_buffer(longitude: float, latitude: float, raio_km: float = 1.5
             geom = shape(layer['geometry'])
             if not geom.is_valid:
                 geom = geom.buffer(0)
-            if geom.is_valid and geom.intersects(buffer):
-                intersecao = geom.intersection(buffer)
+            # Reprojeta geometria para métrico antes de intersectar com buffer_m
+            try:
+                gdf_geom = gpd.GeoSeries([geom], crs=crs_geo).to_crs(crs_metric).iloc[0]
+            except Exception:
+                # Se houver falha de CRS no layer específico, ignora este feature
+                continue
+            if gdf_geom.is_valid and gdf_geom.intersects(buffer_m):
+                intersecao = gdf_geom.intersection(buffer_m)
                 if not intersecao.is_empty:
-                    nome_camada = layer['properties'].get('CLASSE')
+                    nome_camada = layer.get('properties', {}).get('CLASSE')
                     if nome_camada in VEGETACAO_APICULTOR:
                         soma_areas += intersecao.area / 10000.0
-    return round(soma_areas, 2)
+    return round(float(soma_areas), 2)
 
 
 def area_vegetacao_dentro_buffer(longitude: float, latitude: float, raio_km: float = 1.5, geojson_files: list = None):
-    ponto = Point(float(longitude), float(latitude))
-    buffer = ponto.buffer(raio_km * 1000)
-    soma_areas = 0
+    crs_metric = "EPSG:31983"
+    crs_geo = "EPSG:4326"
     if not geojson_files:
         return 0.0
-    for filename in geojson_files:
-        with open(filename, 'r') as f:
-            geojson_data = json.load(f)
-        for layer in geojson_data['features']:
-            geom = shape(layer['geometry'])
-            if not geom.is_valid:
-                geom = geom.buffer(0)
-            if geom.is_valid and geom.intersects(buffer):
-                intersecao = geom.intersection(buffer)
-                if not intersecao.is_empty:
-                    nome_camada = layer['properties'].get('CLASSE')
-                    if nome_camada in VEGETACAO_APICULTOR:
-                        soma_areas += intersecao.area / 10000.0
-    return round(soma_areas, 2)
+    try:
+        centro = Point(float(longitude), float(latitude))
+        gdf_centro = gpd.GeoDataFrame(geometry=[centro], crs=crs_geo).to_crs(crs_metric)
+        buffer_m = gdf_centro.geometry.iloc[0].buffer(raio_km * 1000)
+        gdf_todas = concat_geojsons([get_geojson_file_cached(f) for f in geojson_files], crs_geo, crs_metric)
+        gdf_vegetacao = gdf_todas[gdf_todas['CLASSE'].isin(VEGETACAO_APICULTOR)].copy()
+        gdf_vegetacao = gdf_vegetacao[gdf_vegetacao.intersects(buffer_m)].copy()
+        if gdf_vegetacao.empty:
+            return 0.0
+        gdf_vegetacao['intersecao'] = gdf_vegetacao.geometry.intersection(buffer_m)
+        gdf_vegetacao = gdf_vegetacao[~gdf_vegetacao['intersecao'].is_empty]
+        if gdf_vegetacao.empty:
+            return 0.0
+        gdf_vegetacao['area_intersecao_ha'] = gdf_vegetacao['intersecao'].area / 10000.0
+        return round(float(gdf_vegetacao['area_intersecao_ha'].sum()), 2)
+    except Exception:
+        return 0.0
 
 
 def area_vegetacao_dentro_buffer_apiario(longitude: float, latitude: float, raio_km: float = 1.5, geojson_files: list = None):
-    ponto = Point(float(longitude), float(latitude))
-    buffer = ponto.buffer(raio_km * 1000)
-    soma_areas = 0
+    crs_metric = "EPSG:31983"
+    crs_geo = "EPSG:4326"
     if not geojson_files:
         return 0.0
-    for filename in geojson_files:
-        with open(filename, 'r') as f:
-            geojson_data = json.load(f)
-        for layer in geojson_data['features']:
-            geom = shape(layer['geometry'])
-            if not geom.is_valid:
-                geom = geom.buffer(0)
-            if geom.is_valid and geom.intersects(buffer):
-                intersecao = geom.intersection(buffer)
-                if not intersecao.is_empty:
-                    nome_camada = layer['properties'].get('CLASSE')
-                    if nome_camada in VEGETACAO_APICULTOR:
-                        soma_areas += intersecao.area / 10000.0
-    return round(soma_areas, 2)
+    try:
+        centro = Point(float(longitude), float(latitude))
+        gdf_centro = gpd.GeoDataFrame(geometry=[centro], crs=crs_geo).to_crs(crs_metric)
+        buffer_m = gdf_centro.geometry.iloc[0].buffer(raio_km * 1000)
+        gdf_todas = concat_geojsons([get_geojson_file_cached(f) for f in geojson_files], crs_geo, crs_metric)
+        gdf_vegetacao = gdf_todas[gdf_todas['CLASSE'].isin(VEGETACAO_APICULTOR)].copy()
+        gdf_vegetacao = gdf_vegetacao[gdf_vegetacao.intersects(buffer_m)].copy()
+        if gdf_vegetacao.empty:
+            return 0.0
+        gdf_vegetacao['intersecao'] = gdf_vegetacao.geometry.intersection(buffer_m)
+        gdf_vegetacao = gdf_vegetacao[~gdf_vegetacao['intersecao'].is_empty]
+        if gdf_vegetacao.empty:
+            return 0.0
+        gdf_vegetacao['area_intersecao_ha'] = gdf_vegetacao['intersecao'].area / 10000.0
+        return round(float(gdf_vegetacao['area_intersecao_ha'].sum()), 2)
+    except Exception:
+        return 0.0
 
 
 def area_vegetacao_dentro_buffer_meliponario(longitude: float, latitude: float, raio_km: float = 1.2, geojson_files: list = None):
@@ -162,33 +203,36 @@ def area_vegetacao_dentro_buffer_meliponario(longitude: float, latitude: float, 
     """
     import logging
     logger = logging.getLogger(__name__)
-    ponto = Point(float(longitude), float(latitude))
-    buffer = ponto.buffer(raio_km * 1000)
-    soma_areas = 0.0
+    crs_metric = "EPSG:31983"
+    crs_geo = "EPSG:4326"
     if not geojson_files:
         logger.warning("Nenhum arquivo geojson fornecido para cálculo de área de vegetação.")
         return 0.0
-    logger.info(f"Iniciando cálculo de área de vegetação para meliponário em ({latitude}, {longitude}) com raio {raio_km} km.")
-    for filename in geojson_files:
-        try:
-            with open(filename, 'r') as f:
-                geojson_data = json.load(f)
-            for layer in geojson_data['features']:
-                geom = shape(layer['geometry'])
-                if not geom.is_valid:
-                    geom = geom.buffer(0)
-                if geom.is_valid and geom.intersects(buffer):
-                    intersecao = geom.intersection(buffer)
-                    if not intersecao.is_empty:
-                        nome_camada = layer['properties'].get('CLASSE')
-                        if nome_camada in VEGETACAO_MELIPONARIO:
-                            area_intersecao = intersecao.area / 10000.0
-                            soma_areas += area_intersecao
-                            logger.debug(f"Arquivo: {filename}, Classe: {nome_camada}, Área adicionada: {area_intersecao:.4f} ha")
-        except Exception as e:
-            logger.error(f"Erro ao processar arquivo {filename}: {e}")
-    logger.info(f"Área total de vegetação adequada encontrada: {soma_areas:.2f} ha")
-    return round(soma_areas, 2)
+    try:
+        logger.info(f"Iniciando cálculo de área de vegetação para meliponário em ({latitude}, {longitude}) com raio {raio_km} km.")
+        centro = Point(float(longitude), float(latitude))
+        gdf_centro = gpd.GeoDataFrame(geometry=[centro], crs=crs_geo).to_crs(crs_metric)
+        buffer_m = gdf_centro.geometry.iloc[0].buffer(raio_km * 1000)
+        gdf_todas = concat_geojsons([get_geojson_file_cached(f) for f in geojson_files], crs_geo, crs_metric)
+        gdf_vegetacao = gdf_todas[gdf_todas['CLASSE'].isin(VEGETACAO_MELIPONARIO)].copy()
+        gdf_vegetacao = gdf_vegetacao[gdf_vegetacao.intersects(buffer_m)].copy()
+        if gdf_vegetacao.empty:
+            logger.info("Nenhuma classe de vegetação adequada encontrada dentro do buffer.")
+            return 0.0
+        gdf_vegetacao['intersecao'] = gdf_vegetacao.geometry.intersection(buffer_m)
+        gdf_vegetacao = gdf_vegetacao[~gdf_vegetacao['intersecao'].is_empty]
+        if gdf_vegetacao.empty:
+            logger.info("Nenhuma interseção de vegetação adequada encontrada após recorte do buffer.")
+            return 0.0
+        gdf_vegetacao['area_intersecao_ha'] = gdf_vegetacao['intersecao'].area / 10000.0
+        soma_areas = float(gdf_vegetacao['area_intersecao_ha'].sum())
+        for _, row in gdf_vegetacao.iterrows():
+            logger.debug(f"Classe: {row.get('CLASSE')}, Área adicionada: {row['area_intersecao_ha']:.4f} ha")
+        logger.info(f"Área total de vegetação adequada encontrada: {soma_areas:.2f} ha")
+        return round(soma_areas, 2)
+    except Exception as e:
+        logger.error(f"Erro ao processar arquivos GeoJSON: {e}")
+        return 0.0
 
 
 def read_files_from_directory(directory):
@@ -256,9 +300,18 @@ def process_apicultor(latitude: str, longitude: str, buffers_existentes: Optiona
         if existe_apiario_mesma_coordenada(latitude, longitude):
             raise Exception('Já existe um apiário cadastrado nesta coordenada!')
 
-        # Busca apiários no raio de 1.5km
-        apiarios_intersecao = buscar_apiarios_no_raio(latitude, longitude, raio=1.5)
-        colmeias_intersecao = sum([a.quantidadeColmeias for a in apiarios_intersecao])
+        # Colmeias existentes no raio: usar buffers_existentes, se fornecido; caso contrário, fallback mock
+        colmeias_intersecao = 0
+        if buffers_existentes:
+            for buf in buffers_existentes:
+                if buf['buffer'].intersects(buffer_novo):
+                    try:
+                        colmeias_intersecao += int(buf['colmeias'])
+                    except Exception:
+                        continue
+        else:
+            apiarios_intersecao = buscar_apiarios_no_raio(latitude, longitude, raio=1.5)
+            colmeias_intersecao = sum([a.quantidadeColmeias for a in apiarios_intersecao])
 
         geojson_files = list_geojson_files_from_minio()
         gdf_todas = concat_geojsons([get_geojson_file_cached(f) for f in geojson_files], crs_geo, crs_metric)
@@ -315,39 +368,63 @@ def identificar_bioma_por_ponto(longitude: float, latitude: float, geojson_bioma
 
 async def verificar_sobreposicao_apiario(longitude: float, latitude: float, raio_km: float, session: AsyncSession) -> bool:
     """
-    Verifica se já existe apiário/meliponário na mesma coordenada ou dentro do raio.
+    Verifica se já existe apiário/meliponário na mesma coordenada ou dentro do raio (em km).
     Retorna True se houver sobreposição, False caso contrário.
     """
-    from models.apiary import Apiary
-    ponto = Point(longitude, latitude)
-    result = await session.execute(select(Apiary))
-    apiarios = result.scalars().all()
-    for apiario in apiarios:
-        ponto_apiario = Point(float(apiario.longitude), float(apiario.latitude))
-        if ponto.equals(ponto_apiario):
-            return True
-        if ponto.distance(ponto_apiario) <= raio_km / 111:  # Aproximação: 1 grau ~ 111km
-            return True
-    return False
+    import math
+    try:
+        def haversine_km(lat1, lon1, lat2, lon2):
+            R = 6371.0088  # Raio médio da Terra em km
+            phi1, phi2 = math.radians(lat1), math.radians(lat2)
+            dphi = math.radians(lat2 - lat1)
+            dlambda = math.radians(lon2 - lon1)
+            a = math.sin(dphi / 2) ** 2 + math.cos(phi1) * math.cos(phi2) * math.sin(dlambda / 2) ** 2
+            c = 2 * math.atan2(math.sqrt(a), math.sqrt(1 - a))
+            return R * c
+
+        result = await session.execute(select(Apiary))
+        apiarios = result.scalars().all()
+        for apiario in apiarios:
+            lon_api, lat_api = float(apiario.longitude), float(apiario.latitude)
+            # Mesma coordenada exata
+            if float(longitude) == lon_api and float(latitude) == lat_api:
+                return True
+            # Distância geodésica
+            if haversine_km(float(latitude), float(longitude), lat_api, lon_api) <= float(raio_km):
+                return True
+        return False
+    except Exception as e:
+        import logging
+        logging.getLogger(__name__).error(f"Erro ao verificar sobreposição de apiário: {e}")
+        return False
 
 
 async def calcular_capacidade_suporte_com_interseccao(area_ha: float, bioma: str, tipo_cultura: str, longitude: float, latitude: float, raio_km: float, session: AsyncSession) -> int:
     """
     Calcula capacidade de suporte conforme bioma/cultura e subtrai colmeias existentes no raio.
     """
+    import math
     if tipo_cultura == 'MELIPONICULTOR':
         capacidade = calcular_capacidade_suporte_meliponicultura(area_ha)
     else:
         capacidade = calcular_capacidade_suporte_apicultura(area_ha, bioma, tipo_cultura)
+
+    def haversine_km(lat1, lon1, lat2, lon2):
+        R = 6371.0088
+        phi1, phi2 = math.radians(lat1), math.radians(lat2)
+        dphi = math.radians(lat2 - lat1)
+        dlambda = math.radians(lon2 - lon1)
+        a = math.sin(dphi / 2) ** 2 + math.cos(phi1) * math.cos(phi2) * math.sin(dlambda / 2) ** 2
+        c = 2 * math.atan2(math.sqrt(a), math.sqrt(1 - a))
+        return R * c
+
     # Busca apiários/meliponários no raio
-    from models.apiary import Apiary
-    ponto = Point(longitude, latitude)
     result = await session.execute(select(Apiary))
     apiarios = result.scalars().all()
     colmeias_intersecao = 0
     for apiario in apiarios:
-        ponto_apiario = Point(float(apiario.longitude), float(apiario.latitude))
-        if ponto.distance(ponto_apiario) <= raio_km / 111:
+        lon_api, lat_api = float(apiario.longitude), float(apiario.latitude)
+        if haversine_km(float(latitude), float(longitude), lat_api, lon_api) <= float(raio_km):
             colmeias_intersecao += apiario.quantidadeColmeias
     return max(capacidade - colmeias_intersecao, 0)
 
@@ -355,7 +432,7 @@ async def calcular_capacidade_suporte_com_interseccao(area_ha: float, bioma: str
 def process_meliponicultor(latitude: str, longitude: str, especie: str, buffers_existentes: Optional[list] = None, return_area_only: bool = False, raio_km: float = None):
     """
     Processa o cálculo de área de vegetação e capacidade de suporte para meliponário, usando buffer dinâmico conforme espécie e classes específicas.
-    Permite sobrescrever o raio do buffer via parâmetro opcional raio_km.
+    Retorna um dicionário detalhado com áreas, capacidade calculada e capacidade final.
     """
     import logging
     logger = logging.getLogger(__name__)
@@ -395,7 +472,14 @@ def process_meliponicultor(latitude: str, longitude: str, especie: str, buffers_
         if capacidade_final < 0:
             capacidade_final = 0
         logger.info(f"[MELIPONARIO] Capacidade de suporte final: {capacidade_final}")
-        return capacidade_final if not return_area_only else area_total
+        return {
+            "capacidade_final": capacidade_final,
+            "capacidade_calculada": capacidade,
+            "area_total": soma_areas,
+            "areas_por_vegetacao": areas,
+            "raio_buffer": raio_buffer,
+            "colmeias_existentes": colmeias_intersecao
+        }
     except Exception as e:
         logger.error(f"[MELIPONARIO] Erro no processamento: {e}")
         return None
