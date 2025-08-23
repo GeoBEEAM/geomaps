@@ -21,7 +21,7 @@ if config.config_file_name is not None:
 load_dotenv()
 db_url = os.getenv("DB_URL")
 if db_url and db_url.startswith("postgresql+asyncpg"):
-    db_url = db_url.replace("postgresql+asyncpg", "postgresql+psycopg2")
+    db_url = db_url.replace("postgresql+asyncpg", "postgresql+psycopg")
 if db_url:
     config.set_main_option("sqlalchemy.url", db_url)
 

@@ -189,8 +189,9 @@ async def delete_apiary(id: int, session: AsyncSession = Depends(get_session),
         raise HTTPException(status_code=status.HTTP_404_NOT_FOUND, detail=MSG_APIARY_NOT_FOUND)
     if apiary.userId != auth_user.id:
         raise HTTPException(status_code=status.HTTP_403_FORBIDDEN, detail=MSG_FORBIDDEN_DELETE_APIARY)
-    async with session.begin():
-        await session.delete(apiary)
-        await log_action(session, user_id=auth_user.id, action="DELETE", entity="APIARY", entity_id=apiary.id,
-                         details=f"Apiário deletado: {apiary.name}")
+    # Executa a exclusão e o log na mesma transação implícita e confirma
+    await session.delete(apiary)
+    await log_action(session, user_id=auth_user.id, action="DELETE", entity="APIARY", entity_id=apiary.id,
+                     details=f"Apiário deletado: {apiary.name}")
+    await session.commit()
     return Response(status_code=status.HTTP_204_NO_CONTENT)

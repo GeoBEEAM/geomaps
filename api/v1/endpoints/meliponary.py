@@ -18,7 +18,7 @@ logger = logging.getLogger(__name__)
 logging.basicConfig(level=logging.INFO, format='%(asctime)s - %(name)s - %(levelname)s - %(message)s')
 
 
-@meliponary_router.post('/', response_model=MeliponarySchema, status_code=status.HTTP_201_CREATED)
+@meliponary_router.post('', response_model=MeliponarySchema, status_code=status.HTTP_201_CREATED)
 async def create_meliponary(
         meliponary: MeliponaryCreateSchema,
         auth_user: User = Depends(get_current_user),
@@ -143,7 +143,7 @@ async def create_meliponary(
     return response
 
 
-@meliponary_router.get('/', response_model=List[MeliponarySchema])
+@meliponary_router.get('', response_model=List[MeliponarySchema])
 async def get_meliponaries(session: AsyncSession = Depends(get_session), auth_user: User = Depends(get_current_user)):
     result = await session.execute(select(Meliponary).filter(Meliponary.userId == auth_user.id))
     return result.scalars().all()
@@ -193,8 +193,9 @@ async def delete_meliponary(id: int, session: AsyncSession = Depends(get_session
     if meliponary.userId != auth_user.id:
         raise HTTPException(status_code=status.HTTP_403_FORBIDDEN,
                             detail="Você não tem permissão para deletar este meliponário.")
-    async with session.begin():
-        await session.delete(meliponary)
-        await log_action(session, user_id=auth_user.id, action="DELETE", entity="MELIPONARY", entity_id=meliponary.id,
-                         details=f"Meliponário deletado: {meliponary.name}")
+    # Executa a exclusão e o log na mesma transação implícita e confirma
+    await session.delete(meliponary)
+    await log_action(session, user_id=auth_user.id, action="DELETE", entity="MELIPONARY", entity_id=meliponary.id,
+                     details=f"Meliponário deletado: {meliponary.name}")
+    await session.commit()
     return Response(status_code=status.HTTP_204_NO_CONTENT)
